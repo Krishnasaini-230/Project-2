@@ -25,7 +25,7 @@ themeCheckbox.addEventListener('change', (e) => {
 });
 
 // ==========================================
-// 2. STATE ARCHITECTURE (With WIP Limits)
+// 2. STATE ARCHITECTURE & SCHEMA VALIDATION
 // ==========================================
 let boardState = [
   { id: "col-todo", title: "To Do", wipLimit: null, cards: [{ id: "c-1", text: "Wireframe UI", blockedBy: [] }] },
@@ -34,28 +34,73 @@ let boardState = [
   { id: "col-done", title: "Done", wipLimit: null, cards: [] }
 ];
 
+// FIREWALL 1: The Strict Schema Validator
+// This prevents corrupted JSON or truncated URLs from crashing the rendering engine.
+function validateBoardSchema(data) {
+    if (!Array.isArray(data)) return false;
+    const requiredCols = ['col-todo', 'col-done']; // Mandatory for internal physics
+    let foundCols = [];
+
+    for (let col of data) {
+        if (!col || typeof col !== 'object') return false;
+        if (!col.id || typeof col.title !== 'string') return false;
+        if (!Array.isArray(col.cards)) return false;
+        
+        foundCols.push(col.id);
+
+        for (let card of col.cards) {
+            if (!card || typeof card !== 'object') return false;
+            if (!card.id || typeof card.text !== 'string') return false;
+            if (!Array.isArray(card.blockedBy)) return false;
+        }
+    }
+    
+    return requiredCols.every(id => foundCols.includes(id));
+}
+
 function initBoard() {
+    let loadedSuccessfully = false;
     const hash = window.location.hash;
     
+    // Attempt URL Hash Import
     if (hash.startsWith('#state=')) {
         try {
             const base64 = hash.replace('#state=', '');
             const jsonString = decodeURIComponent(escape(atob(base64)));
             const sharedData = JSON.parse(jsonString);
             
-            if (Array.isArray(sharedData) && sharedData[0].hasOwnProperty('cards')) {
+            if (validateBoardSchema(sharedData)) {
                 boardState = sharedData;
                 saveBoard(); 
                 history.replaceState(null, null, window.location.pathname);
                 showToast("Shared board loaded successfully!", "success");
+                loadedSuccessfully = true;
+            } else {
+                throw new Error("Schema Validation Failed");
             }
         } catch (error) {
-            showToast("Invalid or corrupted share link.", "error");
+            showToast("Invalid or truncated share link.", "error");
             history.replaceState(null, null, window.location.pathname);
         }
-    } else {
-        const saved = localStorage.getItem("kanbanState");
-        if (saved) boardState = JSON.parse(saved);
+    } 
+    
+    // Attempt Local Storage Import
+    if (!loadedSuccessfully) {
+        try {
+            const saved = localStorage.getItem("kanbanState");
+            if (saved) {
+                const parsed = JSON.parse(saved);
+                if (validateBoardSchema(parsed)) {
+                    boardState = parsed;
+                } else {
+                    console.warn("Local storage corrupted. Overwriting with defaults.");
+                    showToast("Local data corrupted. Resetting workspace.", "error");
+                    saveBoard(); 
+                }
+            }
+        } catch (e) {
+            console.error("Failed to parse local storage.", e);
+        }
     }
     
     renderBoard(); 
@@ -66,7 +111,6 @@ function generateId() { return 'card-' + Math.random().toString(36).substr(2, 9)
 
 function findCardInState(cardId) {
     for (let col of boardState) {
-        if (!col.cards) continue;
         const card = col.cards.find(c => c.id === cardId);
         if (card) return card;
     }
@@ -86,7 +130,7 @@ function showToast(message, type = 'success') {
 }
 
 // ==========================================
-// 4. THE DEPENDENCY ENGINE (FIXED CYCLE CRASH)
+// 4. THE DEPENDENCY ENGINE (DAG LOGIC)
 // ==========================================
 let isLinkingMode = false;
 let linkingSourceId = null;
@@ -145,7 +189,8 @@ let sourceColumnId = null;
 function isCardBlocked(card) {
     if (!card || !card.blockedBy || card.blockedBy.length === 0) return false;
     const doneCol = boardState.find(col => col.id === 'col-done');
-    if (!doneCol) return false;
+    if (!doneCol || !doneCol.cards) return false;
+    
     for (let blockerId of card.blockedBy) {
         const isFinished = doneCol.cards.some(c => c.id === blockerId);
         if (!isFinished) return true;
@@ -176,6 +221,10 @@ function setupDragEvents() {
         card.addEventListener('dragend', () => {
             card.classList.remove('is-dragging');
             columns.forEach(col => col.parentElement.classList.remove('drag-over'));
+            
+            // FIREWALL 3: Clear Drag State to prevent external event teleportation
+            draggedCardId = null;
+            sourceColumnId = null;
             renderBoard();
         });
     });
@@ -197,7 +246,7 @@ function setupDragEvents() {
         list.addEventListener('dragleave', () => { list.parentElement.classList.remove('drag-over'); });
 
         list.addEventListener('drop', e => {
-            if(isLinkingMode) return;
+            if(isLinkingMode || !draggedCardId) return;
             e.preventDefault(); 
             list.parentElement.classList.remove('drag-over');
             
@@ -214,7 +263,6 @@ function setupDragEvents() {
                     return;
                 }
 
-                // AGILE WORKFLOW: Only block entry into Terminal Columns
                 const strictColumns = ['col-review', 'col-done'];
                 if (strictColumns.includes(targetColumnId) && isCardBlocked(cardObject)) {
                     triggerCardError(draggedCardId);
@@ -268,15 +316,22 @@ function updateStateAfterDrop(cardId, sourceColId, targetColId, newDomIndex) {
 // ==========================================
 const boardContainer = document.getElementById('board-container');
 
+// FIREWALL 2: The HTML Sanitizer (Protects the DOM from XSS logic bombs)
+function sanitizeHTML(str) {
+    if (typeof str !== 'string') return '';
+    return str.replace(/[&<>"']/g, match => {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[match];
+    });
+}
+
 function deleteCard(cardId) {
     if (!confirm("Are you sure you want to delete this task?")) return;
     for (let col of boardState) {
-        if(!col.cards) continue;
         const index = col.cards.findIndex(c => c.id === cardId);
         if (index !== -1) { col.cards.splice(index, 1); break; }
     }
+    // Clean up orphaned dependencies in other tasks
     for (let col of boardState) {
-        if(!col.cards) continue;
         for (let card of col.cards) {
             if (card.blockedBy && card.blockedBy.includes(cardId)) {
                 card.blockedBy = card.blockedBy.filter(id => id !== cardId);
@@ -296,7 +351,6 @@ function moveCardMobile(cardId, currentColId) {
             showToast(`WIP Limit Reached for ${nextCol.title}`, "error"); return;
         }
         
-        // AGILE WORKFLOW: Block only on terminal columns for mobile too
         const strictColumns = ['col-review', 'col-done'];
         if (strictColumns.includes(nextCol.id) && isCardBlocked(cardObj)) { 
             showToast("Clear dependencies before review/completion.", "error"); return; 
@@ -311,7 +365,6 @@ function renderBoard() {
       const fragment = document.createDocumentFragment();
 
       boardState.forEach((col, colIndex) => {
-        if(!col.cards) col.cards = []; 
         const colEl = document.createElement('div');
         colEl.className = 'column';
         
@@ -319,7 +372,6 @@ function renderBoard() {
         const isAtLimit = col.wipLimit !== null && col.cards.length >= col.wipLimit;
         const limitStyle = isAtLimit ? 'color: var(--error);' : '';
 
-        // FIX: Replaced setWipLimit trigger with openWipModal
         colEl.innerHTML = `<div class="column-header">
             <span>${col.title}</span> 
             <span class="wip-limit" style="${limitStyle}" onclick="openWipModal('${col.id}')" title="Click to set Work-In-Progress limit">
@@ -332,8 +384,6 @@ function renderBoard() {
         listEl.dataset.columnId = col.id;
 
         col.cards.forEach(card => {
-          if(!card || !card.id) return; 
-
           const cardEl = document.createElement('div');
           cardEl.className = 'card';
           if(isLinkingMode && card.id === linkingSourceId) cardEl.classList.add('is-link-source');
@@ -373,7 +423,7 @@ function renderBoard() {
                   <div class="dependency-container">
                       <span class="dependency-badge">🔒 Waiting on:</span>
                       <ul class="blocker-list">
-                          ${blockingNames.map(name => `<li title="${name}">${name}</li>`).join('')}
+                          ${blockingNames.map(name => `<li title="${sanitizeHTML(name)}">${sanitizeHTML(name)}</li>`).join('')}
                       </ul>
                   </div>
               ` : ''}
@@ -450,11 +500,11 @@ document.getElementById('import-input').addEventListener('change', (e) => {
     reader.onload = function(event) {
         try {
             const uploadedData = JSON.parse(event.target.result);
-            if (Array.isArray(uploadedData) && uploadedData[0].hasOwnProperty('cards')) {
+            if (validateBoardSchema(uploadedData)) {
                 boardState = uploadedData;
                 saveBoard(); renderBoard(); showToast("Board imported successfully.");
-            } else { throw new Error("Invalid format"); }
-        } catch (error) { showToast("Failed to import. Invalid JSON file.", "error"); }
+            } else { throw new Error("Invalid schema"); }
+        } catch (error) { showToast("Failed to import. Corrupted JSON file.", "error"); }
     };
     reader.readAsText(file);
     e.target.value = ''; 
@@ -482,7 +532,6 @@ document.getElementById('submit-task-btn').addEventListener('click', submitNewTa
 taskInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') submitNewTask(); });
 modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
 
-// NEW: Custom WIP Modal Logic
 let activeWipColId = null;
 const wipModal = document.getElementById('wip-modal');
 const wipInput = document.getElementById('wip-input');
@@ -492,7 +541,6 @@ function openWipModal(colId) {
     const col = boardState.find(c => c.id === colId);
     if (!col) return;
     
-    // Pre-fill existing limit, or leave empty
     wipInput.value = col.wipLimit !== null ? col.wipLimit : '';
     wipModal.classList.remove('hidden');
     setTimeout(() => wipInput.focus(), 50);
@@ -510,7 +558,7 @@ function submitWipLimit() {
     const val = wipInput.value.trim();
     
     if (val === '') {
-        col.wipLimit = null; // Strip the limit
+        col.wipLimit = null; 
         showToast(`WIP limit removed for ${col.title}`, "info");
     } else {
         const num = parseInt(val, 10);
@@ -532,6 +580,5 @@ document.getElementById('submit-wip-btn').addEventListener('click', submitWipLim
 wipInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') submitWipLimit(); });
 wipModal.addEventListener('click', (e) => { if (e.target === wipModal) closeWipModal(); });
 
-// Boot the application
 initTheme();
 initBoard();
